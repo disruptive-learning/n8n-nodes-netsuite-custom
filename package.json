@@ -1,19 +1,18 @@
 {
-  "name": "n8n-nodes-netsuite",
-  "version": "0.7.5",
-  "description": "n8n node for NetSuite using the REST API",
+  "name": "n8n-nodes-netsuite-custom",
+  "version": "0.8.0",
+  "description": "n8n node for NetSuite using the REST API with Custom Headers Support",
   "license": "MIT",
-  "homepage": "https://github.com/drudge/n8n-nodes-netsuite",
+  "homepage": "https://github.com/disruptive-learning/n8n-nodes-netsuite-custom",
   "engines": {
     "node": ">=18.17"
   },
   "author": {
-    "name": "Nicholas Penree",
-    "email": "nick@penree.com"
+    "name": "GigStack"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/drudge/n8n-nodes-netsuite.git"
+    "url": "git+https://github.com/disruptive-learning/n8n-nodes-netsuite-custom.git"
   },
   "main": "index.js",
   "scripts": {
@@ -39,10 +38,12 @@
   "n8n": {
     "n8nNodesApiVersion": 1,
     "credentials": [
-      "dist/credentials/NetSuite.credentials.js"
+      "dist/credentials/NetSuite.credentials.js",
+      "dist/credentials/NetSuiteCustom.credentials.js"
     ],
     "nodes": [
-      "dist/nodes/NetSuite/NetSuite.node.js"
+      "dist/nodes/NetSuite/NetSuite.node.js",
+      "dist/nodes/NetSuiteCustom/NetSuiteCustom.node.js"
     ]
   },
   "devDependencies": {
