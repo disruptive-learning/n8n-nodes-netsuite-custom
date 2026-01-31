@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-netsuite-custom",
-  "version": "0.8.0",
+  "version": "0.8.2",
   "description": "n8n node for NetSuite using the REST API with Custom Headers Support",
   "license": "MIT",
   "homepage": "https://github.com/disruptive-learning/n8n-nodes-netsuite-custom",
@@ -38,11 +38,9 @@
   "n8n": {
     "n8nNodesApiVersion": 1,
     "credentials": [
-      "dist/credentials/NetSuite.credentials.js",
       "dist/credentials/NetSuiteCustom.credentials.js"
     ],
     "nodes": [
-      "dist/nodes/NetSuite/NetSuite.node.js",
       "dist/nodes/NetSuiteCustom/NetSuiteCustom.node.js"
     ]
   },
