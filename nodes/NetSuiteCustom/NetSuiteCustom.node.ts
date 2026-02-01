@@ -16,7 +16,6 @@ import {
 	INetSuiteOperationOptions,
 	INetSuitePagedBody,
 	INetSuiteRequestOptions,
-	INetSuiteResponse,
 	NetSuiteRequestType,
 } from './NetSuiteCustom.node.types';
 
@@ -24,32 +23,162 @@ import {
 	nodeDescription,
 } from './NetSuiteCustom.node.options';
 
-import { makeRequest } from '@fye/netsuite-rest-api';
-import OAuth from 'oauth-1.0a';
-
-import pLimit from 'p-limit';
-
 const debug = debuglog('n8n-nodes-netsuite-custom');
 
-const handleNetsuiteResponse = (fns: IExecuteFunctions, response: INetSuiteResponse) => {
-	// debug(response);
+// OAuth 1.0a implementation
+const createOAuth = (credentials: INetSuiteCredentials) => {
+	const nonceLength = 20;
+	const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+	const generateNonce = () => {
+		let result = '';
+		for (let i = 0; i < nonceLength; i++) {
+			result += chars.charAt(Math.floor(Math.random() * chars.length));
+		}
+		return result;
+	};
+
+	const percentEncode = (str: string) => {
+		return encodeURIComponent(str)
+			.replace(/!/g, '%21')
+			.replace(/\*/g, '%2A')
+			.replace(/'/g, '%27')
+			.replace(/\(/g, '%28')
+			.replace(/\)/g, '%29');
+	};
+
+	const getBaseString = (method: string, url: string, params: Record<string, string>) => {
+		const sortedParams = Object.keys(params)
+			.sort()
+			.map(key => `${percentEncode(key)}=${percentEncode(params[key])}`)
+			.join('&');
+
+		const urlObj = new URL(url);
+		const baseUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
+
+		return `${method.toUpperCase()}&${percentEncode(baseUrl)}&${percentEncode(sortedParams)}`;
+	};
+
+	const getSigningKey = () => {
+		return `${percentEncode(credentials.consumerSecret)}&${percentEncode(credentials.tokenSecret)}`;
+	};
+
+	const sign = (baseString: string) => {
+		return crypto
+			.createHmac('sha256', getSigningKey())
+			.update(baseString)
+			.digest('base64');
+	};
+
+	return {
+		getAuthHeader: (method: string, url: string) => {
+			const timestamp = Math.floor(Date.now() / 1000).toString();
+			const nonce = generateNonce();
+
+			const oauthParams: Record<string, string> = {
+				oauth_consumer_key: credentials.consumerKey,
+				oauth_nonce: nonce,
+				oauth_signature_method: 'HMAC-SHA256',
+				oauth_timestamp: timestamp,
+				oauth_token: credentials.tokenKey,
+				oauth_version: '1.0',
+			};
+
+			const baseString = getBaseString(method, url, oauthParams);
+			const signature = sign(baseString);
+			oauthParams.oauth_signature = signature;
+
+			const authHeader = 'OAuth realm="' + credentials.accountId + '",' +
+				Object.keys(oauthParams)
+					.sort()
+					.map(key => `${percentEncode(key)}="${percentEncode(oauthParams[key])}"`)
+					.join(',');
+
+			return { Authorization: authHeader };
+		},
+	};
+};
+
+// Custom makeRequest using n8n's httpRequest helper
+const makeNetSuiteRequest = async (
+	fns: IExecuteFunctions,
+	credentials: INetSuiteCredentials,
+	requestOptions: INetSuiteRequestOptions,
+	customHeaders: Record<string, string> = {},
+) => {
+	const { method, path, query, nextUrl, requestType } = requestOptions;
+
+	// Build URL
+	let url: string;
+	if (nextUrl) {
+		url = nextUrl;
+	} else {
+		url = `https://${credentials.hostname}/${path}`;
+	}
+
+	// Get OAuth headers
+	const oauth = createOAuth(credentials);
+	const oauthHeaders = oauth.getAuthHeader(method, url);
+
+	// Merge headers
+	const headers: Record<string, string> = {
+		...oauthHeaders,
+		'Content-Type': 'application/json; charset=utf-8',
+		'prefer': 'transient',
+		...customHeaders,
+	};
+
+	// Build body
+	let body: any = undefined;
+	if (query && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+		if (requestType === NetSuiteRequestType.SuiteQL) {
+			body = { q: query };
+		} else {
+			body = typeof query === 'string' ? JSON.parse(query) : query;
+		}
+	}
+
+	debug('makeNetSuiteRequest URL:', url);
+	debug('makeNetSuiteRequest method:', method);
+	debug('makeNetSuiteRequest headers:', headers);
+
+	const response = await fns.helpers.httpRequest({
+		method: method as IHttpRequestMethods,
+		url,
+		headers,
+		body,
+		returnFullResponse: true,
+		ignoreHttpStatusErrors: true,
+		json: true,
+	});
+
+	return {
+		statusCode: response.statusCode,
+		statusText: response.statusCode >= 200 && response.statusCode < 300 ? 'OK' : 'Error',
+		body: response.body as any,
+		headers: response.headers,
+		request: { options: { method } },
+	};
+};
+
+const handleNetsuiteResponse = (fns: IExecuteFunctions, response: any) => {
 	debug(`Netsuite response:`, response.statusCode, response.body);
 	let body: JsonObject = {};
+	const responseBody = response.body || {};
 	const {
 		title: webTitle = undefined,
-		// code: restletCode = undefined,
 		'o:errorCode': webCode,
 		'o:errorDetails': webDetails,
 		message: restletMessage = undefined,
-	} = response.body;
+	} = responseBody;
+
 	if (!(response.statusCode && response.statusCode >= 200 && response.statusCode < 400)) {
 		let message = webTitle || restletMessage || webCode || response.statusText;
 		if (webDetails && webDetails.length > 0) {
 			message = webDetails[0].detail || message;
 		}
 		if (fns.continueOnFail() !== true) {
-			// const code = webCode || restletCode;
-			const error = new NodeApiError(fns.getNode(), response.body);
+			const error = new NodeApiError(fns.getNode(), responseBody);
 			error.message = message;
 			throw error;
 		} else {
@@ -58,9 +187,9 @@ const handleNetsuiteResponse = (fns: IExecuteFunctions, response: INetSuiteRespo
 			};
 		}
 	} else {
-		body = response.body;
-		if ([ 'POST', 'PATCH', 'DELETE' ].includes(response.request.options.method)) {
-			body = typeof body === 'object' ? response.body : {};
+		body = responseBody;
+		if (['POST', 'PATCH', 'DELETE'].includes(response.request.options.method)) {
+			body = typeof body === 'object' ? responseBody : {};
 			if (response.headers['x-netsuite-propertyvalidation']) {
 				body.propertyValidation = response.headers['x-netsuite-propertyvalidation'].split(',');
 			}
@@ -82,43 +211,7 @@ const handleNetsuiteResponse = (fns: IExecuteFunctions, response: INetSuiteRespo
 			body.success = response.statusCode === 204;
 		}
 	}
-	// debug(body);
 	return { json: body };
-};
-
-const getConfig = (credentials: INetSuiteCredentials) => ({
-	netsuiteApiHost: credentials.hostname,
-	consumerKey: credentials.consumerKey,
-	consumerSecret: credentials.consumerSecret,
-	netsuiteAccountId: credentials.accountId,
-	netsuiteTokenKey: credentials.tokenKey,
-	netsuiteTokenSecret: credentials.tokenSecret,
-	netsuiteQueryLimit: 1000,
-});
-
-// OAuth 1.0a helper for custom headers support
-const getOAuthHeaders = (credentials: INetSuiteCredentials, requestData: { url: string; method: string }) => {
-	const oauth = new OAuth({
-		consumer: {
-			key: credentials.consumerKey,
-			secret: credentials.consumerSecret,
-		},
-		realm: credentials.accountId,
-		signature_method: 'HMAC-SHA256',
-		hash_function(baseString: string, key: string) {
-			return crypto
-				.createHmac('sha256', key)
-				.update(baseString)
-				.digest('base64');
-		},
-	});
-
-	const token = {
-		key: credentials.tokenKey,
-		secret: credentials.tokenSecret,
-	};
-
-	return oauth.toHeader(oauth.authorize(requestData, token));
 };
 
 export class NetSuiteCustom implements INodeType {
@@ -164,11 +257,11 @@ export class NetSuiteCustom implements INodeType {
 		nodeContext.hasMore = hasMore;
 		nodeContext.count = limit;
 		nodeContext.offset = offset;
-		// debug('requestData', requestData);
+
 		while ((returnAll || returnData.length < limit) && hasMore === true) {
-			const response = await makeRequest(getConfig(credentials), requestData);
+			const response = await makeNetSuiteRequest(fns, credentials, requestData);
 			const body: JsonObject = handleNetsuiteResponse(fns, response);
-			const { hasMore: doContinue, items, links, offset, count, totalResults } = (body.json as INetSuitePagedBody);
+			const { hasMore: doContinue, items, links, offset: respOffset, count, totalResults } = (body.json as INetSuitePagedBody);
 			if (doContinue) {
 				nextUrl = (links.find((link) => link.rel === 'next') || {}).href;
 				requestData.nextUrl = nextUrl;
@@ -183,7 +276,7 @@ export class NetSuiteCustom implements INodeType {
 			hasMore = doContinue && (returnAll || returnData.length < limit);
 			nodeContext.hasMore = doContinue;
 			nodeContext.count = count;
-			nodeContext.offset = offset;
+			nodeContext.offset = respOffset;
 			nodeContext.totalResults = totalResults;
 			if (requestData.nextUrl) {
 				nodeContext.nextUrl = requestData.nextUrl;
@@ -206,7 +299,6 @@ export class NetSuiteCustom implements INodeType {
 		const requestType = NetSuiteRequestType.SuiteQL;
 		const params = new URLSearchParams();
 		const returnData: INodeExecutionData[] = [];
-		const config = getConfig(credentials);
 		let prefix = '?';
 		if (returnAll !== true) {
 			limit = fns.getNodeParameter('limit', itemIndex) as number || limit;
@@ -214,7 +306,6 @@ export class NetSuiteCustom implements INodeType {
 			params.set('offset', String(offset));
 		}
 		params.set('limit', String(limit));
-		config.netsuiteQueryLimit = limit;
 		prefix += params.toString();
 		const requestData: INetSuiteRequestOptions = {
 			method,
@@ -226,10 +317,11 @@ export class NetSuiteCustom implements INodeType {
 		nodeContext.count = limit;
 		nodeContext.offset = offset;
 		debug('requestData', requestData);
+
 		while ((returnAll || returnData.length < limit) && hasMore === true) {
-			const response = await makeRequest(config, requestData);
+			const response = await makeNetSuiteRequest(fns, credentials, requestData);
 			const body: JsonObject = handleNetsuiteResponse(fns, response);
-			const { hasMore: doContinue, items, links, count, totalResults, offset } = (body.json as INetSuitePagedBody);
+			const { hasMore: doContinue, items, links, count, totalResults, offset: respOffset } = (body.json as INetSuitePagedBody);
 			if (doContinue) {
 				nextUrl = (links.find((link) => link.rel === 'next') || {}).href;
 				requestData.nextUrl = nextUrl;
@@ -244,7 +336,7 @@ export class NetSuiteCustom implements INodeType {
 			hasMore = doContinue && (returnAll || returnData.length < limit);
 			nodeContext.hasMore = doContinue;
 			nodeContext.count = count;
-			nodeContext.offset = offset;
+			nodeContext.offset = respOffset;
 			nodeContext.totalResults = totalResults;
 			if (requestData.nextUrl) {
 				nodeContext.nextUrl = requestData.nextUrl;
@@ -268,12 +360,12 @@ export class NetSuiteCustom implements INodeType {
 			params.append('simpleEnumFormat', 'true');
 		}
 		const q = params.toString();
-		const requestData = {
+		const requestData: INetSuiteRequestOptions = {
 			method: 'GET',
 			requestType: NetSuiteRequestType.Record,
 			path: `services/rest/record/${apiVersion}/${recordType}/${internalId}${q ? `?${q}` : ''}`,
 		};
-		const response = await makeRequest(getConfig(credentials), requestData);
+		const response = await makeNetSuiteRequest(fns, credentials, requestData);
 		if (item) response.body.orderNo = item.json.orderNo;
 		return handleNetsuiteResponse(fns, response);
 	}
@@ -283,12 +375,12 @@ export class NetSuiteCustom implements INodeType {
 		const apiVersion = fns.getNodeParameter('version', itemIndex) as string;
 		const recordType = NetSuiteCustom.getRecordType(options);
 		const internalId = fns.getNodeParameter('internalId', itemIndex) as string;
-		const requestData = {
+		const requestData: INetSuiteRequestOptions = {
 			method: 'DELETE',
 			requestType: NetSuiteRequestType.Record,
 			path: `services/rest/record/${apiVersion}/${recordType}/${internalId}`,
 		};
-		const response = await makeRequest(getConfig(credentials), requestData);
+		const response = await makeNetSuiteRequest(fns, credentials, requestData);
 		return handleNetsuiteResponse(fns, response);
 	}
 
@@ -303,7 +395,7 @@ export class NetSuiteCustom implements INodeType {
 			path: `services/rest/record/${apiVersion}/${recordType}`,
 		};
 		if (query) requestData.query = query;
-		const response = await makeRequest(getConfig(credentials), requestData);
+		const response = await makeNetSuiteRequest(fns, credentials, requestData);
 		return handleNetsuiteResponse(fns, response);
 	}
 
@@ -319,7 +411,7 @@ export class NetSuiteCustom implements INodeType {
 			path: `services/rest/record/${apiVersion}/${recordType}/${internalId}`,
 		};
 		if (query) requestData.query = query;
-		const response = await makeRequest(getConfig(credentials), requestData);
+		const response = await makeNetSuiteRequest(fns, credentials, requestData);
 		return handleNetsuiteResponse(fns, response);
 	}
 
@@ -351,44 +443,16 @@ export class NetSuiteCustom implements INodeType {
 			path = `${url.pathname.replace(/^\//, '')}${url.search || ''}`;
 		}
 
-		// Build full URL
-		const fullUrl = `https://${credentials.hostname}/${path}`;
-
-		// Get OAuth headers
-		const oauthHeaders = getOAuthHeaders(credentials, { url: fullUrl, method });
-
-		// Merge headers: OAuth + default + custom (custom can override defaults)
-		const headers: Record<string, string> = {
-			...oauthHeaders,
-			'Content-Type': 'application/json; charset=utf-8',
-			'prefer': 'transient',
-			...customHeaders,  // Custom headers override defaults
+		const requestData: INetSuiteRequestOptions = {
+			method,
+			requestType,
+			path,
 		};
-
-		debug('rawRequest URL:', fullUrl);
-		debug('rawRequest headers:', headers);
-
-		// Build request body
-		let requestBody: any = undefined;
 		if (query && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-			if (requestType === 'suiteql') {
-				requestBody = { q: query };
-			} else {
-				requestBody = typeof query === 'string' ? JSON.parse(query) : query;
-			}
+			requestData.query = query;
 		}
 
-		// Make the request using n8n's built-in httpRequest helper
-		const response = await fns.helpers.httpRequest({
-			method: method as IHttpRequestMethods,
-			url: fullUrl,
-			headers,
-			body: requestBody,
-			returnFullResponse: true,
-			ignoreHttpStatusErrors: true,
-			json: true,
-		});
-
+		const response = await makeNetSuiteRequest(fns, credentials, requestData, customHeaders);
 		const respBody = response.body as any;
 
 		if (respBody) {
@@ -416,51 +480,40 @@ export class NetSuiteCustom implements INodeType {
 		const operation = this.getNodeParameter('operation', 0) as string;
 		const items: INodeExecutionData[] = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
-		const promises = [];
-		const options = this.getNodeParameter('options', 0) as IDataObject;
-		const concurrency = options.concurrency as number || 1;
-		const limit = pLimit(concurrency);
 
 		for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
 			const item: INodeExecutionData = items[itemIndex];
 			let data: INodeExecutionData | INodeExecutionData[];
 
-			promises.push(limit(async () =>{
-				debug(`Processing ${operation} for ${itemIndex+1} of ${items.length}`);
-				if (operation === 'getRecord') {
-					data = await NetSuiteCustom.getRecord({ item, fns: this, credentials, itemIndex});
-				} else if (operation === 'listRecords') {
-					data = await NetSuiteCustom.listRecords({ item, fns: this, credentials, itemIndex});
-				} else if (operation === 'removeRecord') {
-					data = await NetSuiteCustom.removeRecord({ item, fns: this, credentials, itemIndex});
-				} else if (operation === 'insertRecord') {
-					data = await NetSuiteCustom.insertRecord({ item, fns: this, credentials, itemIndex});
-				} else if (operation === 'updateRecord') {
-					data = await NetSuiteCustom.updateRecord({ item, fns: this, credentials, itemIndex});
-				} else if (operation === 'rawRequest') {
-					data = await NetSuiteCustom.rawRequest({ item, fns: this, credentials, itemIndex});
-				} else if (operation === 'runSuiteQL') {
-					data = await NetSuiteCustom.runSuiteQL({ item, fns: this, credentials, itemIndex});
-				} else {
-					const error = `The operation "${operation}" is not supported!`;
-					if (this.continueOnFail() !== true) {
-						throw new Error(error);
-					} else {
-						data = { json: { error } };
-					}
-				}
-				return data;
-			}));
-		}
+			debug(`Processing ${operation} for ${itemIndex + 1} of ${items.length}`);
 
-		const results = await Promise.all(promises);
-		for await (const result of results) {
-			if (result) {
-				if (Array.isArray(result)) {
-					returnData.push(...result);
+			if (operation === 'getRecord') {
+				data = await NetSuiteCustom.getRecord({ item, fns: this, credentials, itemIndex });
+			} else if (operation === 'listRecords') {
+				data = await NetSuiteCustom.listRecords({ item, fns: this, credentials, itemIndex });
+			} else if (operation === 'removeRecord') {
+				data = await NetSuiteCustom.removeRecord({ item, fns: this, credentials, itemIndex });
+			} else if (operation === 'insertRecord') {
+				data = await NetSuiteCustom.insertRecord({ item, fns: this, credentials, itemIndex });
+			} else if (operation === 'updateRecord') {
+				data = await NetSuiteCustom.updateRecord({ item, fns: this, credentials, itemIndex });
+			} else if (operation === 'rawRequest') {
+				data = await NetSuiteCustom.rawRequest({ item, fns: this, credentials, itemIndex });
+			} else if (operation === 'runSuiteQL') {
+				data = await NetSuiteCustom.runSuiteQL({ item, fns: this, credentials, itemIndex });
+			} else {
+				const error = `The operation "${operation}" is not supported!`;
+				if (this.continueOnFail() !== true) {
+					throw new Error(error);
 				} else {
-					returnData.push(result);
+					data = { json: { error } };
 				}
+			}
+
+			if (Array.isArray(data)) {
+				returnData.push(...data);
+			} else {
+				returnData.push(data);
 			}
 		}
 
