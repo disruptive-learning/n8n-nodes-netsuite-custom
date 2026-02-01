@@ -1,4 +1,5 @@
 import { debuglog } from 'util';
+import * as crypto from 'crypto';
 import {
 	IDataObject,
 	IExecuteFunctions,
@@ -23,6 +24,8 @@ import {
 } from './NetSuiteCustom.node.options';
 
 import { makeRequest } from '@fye/netsuite-rest-api';
+import OAuth from 'oauth-1.0a';
+import got from 'got';
 
 import pLimit from 'p-limit';
 
@@ -92,6 +95,31 @@ const getConfig = (credentials: INetSuiteCredentials) => ({
 	netsuiteTokenSecret: credentials.tokenSecret,
 	netsuiteQueryLimit: 1000,
 });
+
+// OAuth 1.0a helper for custom headers support
+const getOAuthHeaders = (credentials: INetSuiteCredentials, requestData: { url: string; method: string }) => {
+	const oauth = new OAuth({
+		consumer: {
+			key: credentials.consumerKey,
+			secret: credentials.consumerSecret,
+		},
+		realm: credentials.accountId,
+		signature_method: 'HMAC-SHA256',
+		hash_function(baseString: string, key: string) {
+			return crypto
+				.createHmac('sha256', key)
+				.update(baseString)
+				.digest('base64');
+		},
+	});
+
+	const token = {
+		key: credentials.tokenKey,
+		secret: credentials.tokenSecret,
+	};
+
+	return oauth.toHeader(oauth.authorize(requestData, token));
+};
 
 export class NetSuiteCustom implements INodeType {
 	description: INodeTypeDescription = nodeDescription;
@@ -323,26 +351,51 @@ export class NetSuiteCustom implements INodeType {
 			path = `${url.pathname.replace(/^\//, '')}${url.search || ''}`;
 		}
 
-		const requestData: INetSuiteRequestOptions = {
-			method,
-			requestType,
-			path,
+		// Build full URL
+		const fullUrl = `https://${credentials.hostname}/${path}`;
+
+		// Get OAuth headers
+		const oauthHeaders = getOAuthHeaders(credentials, { url: fullUrl, method });
+
+		// Merge headers: OAuth + default + custom (custom can override defaults)
+		const headers: Record<string, string> = {
+			...oauthHeaders,
+			'Content-Type': 'application/json; charset=utf-8',
+			'prefer': 'transient',
+			...customHeaders,  // Custom headers override defaults
 		};
 
-		// Add custom headers to the request
-		if (Object.keys(customHeaders).length > 0) {
-			requestData.headers = customHeaders;
+		debug('rawRequest URL:', fullUrl);
+		debug('rawRequest headers:', headers);
+
+		// Build request options
+		const requestOptions: any = {
+			url: fullUrl,
+			method,
+			headers,
+			throwHttpErrors: false,
+			http2: true,
+			responseType: 'json',
+		};
+
+		// Add body for non-GET requests
+		if (query && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+			if (requestType === 'suiteql') {
+				requestOptions.json = { q: query };
+			} else {
+				requestOptions.json = typeof query === 'string' ? JSON.parse(query) : query;
+			}
 		}
 
-		if (query && !['GET', 'HEAD', 'OPTIONS'].includes(method)) requestData.query = query;
-		debug('requestData', requestData);
-		const response = await makeRequest(getConfig(credentials), requestData);
+		// Make the request directly with got
+		const response = await got(requestOptions);
 
 		if (response.body) {
-			nodeContext.hasMore = response.body.hasMore;
-			nodeContext.count = response.body.count;
-			nodeContext.offset = response.body.offset;
-			nodeContext.totalResults = response.body.totalResults;
+			const respBody = response.body as any;
+			nodeContext.hasMore = respBody.hasMore;
+			nodeContext.count = respBody.count;
+			nodeContext.offset = respBody.offset;
+			nodeContext.totalResults = respBody.totalResults;
 		}
 
 		if (nodeOptions.fullResponse) {
@@ -354,7 +407,7 @@ export class NetSuiteCustom implements INodeType {
 				},
 			};
 		} else {
-			return { json: response.body };
+			return { json: response.body as unknown as JsonObject };
 		}
 	}
 
