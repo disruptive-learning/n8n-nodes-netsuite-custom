@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import {
 	IDataObject,
 	IExecuteFunctions,
+	IHttpRequestMethods,
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
@@ -25,7 +26,6 @@ import {
 
 import { makeRequest } from '@fye/netsuite-rest-api';
 import OAuth from 'oauth-1.0a';
-import got from 'got';
 
 import pLimit from 'p-limit';
 
@@ -368,30 +368,30 @@ export class NetSuiteCustom implements INodeType {
 		debug('rawRequest URL:', fullUrl);
 		debug('rawRequest headers:', headers);
 
-		// Build request options
-		const requestOptions: any = {
-			url: fullUrl,
-			method,
-			headers,
-			throwHttpErrors: false,
-			http2: true,
-			responseType: 'json',
-		};
-
-		// Add body for non-GET requests
+		// Build request body
+		let requestBody: any = undefined;
 		if (query && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
 			if (requestType === 'suiteql') {
-				requestOptions.json = { q: query };
+				requestBody = { q: query };
 			} else {
-				requestOptions.json = typeof query === 'string' ? JSON.parse(query) : query;
+				requestBody = typeof query === 'string' ? JSON.parse(query) : query;
 			}
 		}
 
-		// Make the request directly with got
-		const response = await got(requestOptions);
+		// Make the request using n8n's built-in httpRequest helper
+		const response = await fns.helpers.httpRequest({
+			method: method as IHttpRequestMethods,
+			url: fullUrl,
+			headers,
+			body: requestBody,
+			returnFullResponse: true,
+			ignoreHttpStatusErrors: true,
+			json: true,
+		});
 
-		if (response.body) {
-			const respBody = response.body as any;
+		const respBody = response.body as any;
+
+		if (respBody) {
 			nodeContext.hasMore = respBody.hasMore;
 			nodeContext.count = respBody.count;
 			nodeContext.offset = respBody.offset;
@@ -403,11 +403,11 @@ export class NetSuiteCustom implements INodeType {
 				json: {
 					statusCode: response.statusCode,
 					headers: response.headers,
-					body: response.body,
+					body: respBody,
 				},
 			};
 		} else {
-			return { json: response.body as unknown as JsonObject };
+			return { json: respBody as JsonObject };
 		}
 	}
 
